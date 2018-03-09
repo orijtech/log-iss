@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"io"
 	"io/ioutil"
@@ -17,6 +18,10 @@ import (
 	"github.com/heroku/authenticater"
 	metrics "github.com/rcrowley/go-metrics"
 	log "github.com/sirupsen/logrus"
+
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/tag"
+	"go.opencensus.io/trace"
 )
 
 type payload struct {
@@ -96,7 +101,7 @@ func (s *httpServer) Run() error {
 	go s.awaitShutdown()
 
 	//FXME: check outlet depth?
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		defer s.healthChecks.UpdateSince(time.Now())
 		if s.isShuttingDown {
 			http.Error(w, "Shutting down", 503)
@@ -105,8 +110,11 @@ func (s *httpServer) Run() error {
 
 	})
 
-	http.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
 		defer s.posts.UpdateSince(time.Now())
+
+		ctx, span := trace.StartSpan(r.Context(), "/logs")
+		defer span.End()
 
 		if s.Config.EnforceSsl && r.Header.Get("X-Forwarded-Proto") != "https" {
 			s.handleHTTPError(w, "Only SSL requests accepted", 400)
@@ -160,7 +168,7 @@ func (s *httpServer) Run() error {
 			body = ioutil.NopCloser(io.TeeReader(body, &buf))
 		}
 
-		if err, status := s.process(body, remoteAddr, requestID, logplexDrainToken); err != nil {
+		if err, status := s.process(ctx, body, remoteAddr, requestID, logplexDrainToken); err != nil {
 			s.handleHTTPError(
 				w, err.Error(), status,
 				log.Fields{"remote_addr": remoteAddr, "requestId": requestID, "logdrain_token": logplexDrainToken},
@@ -193,7 +201,10 @@ func (s *httpServer) Run() error {
 		s.pSuccesses.Inc(1)
 	})
 
-	return http.ListenAndServe(":"+s.Config.HttpPort, nil)
+	h := &ochttp.Handler{
+		Handler: mux,
+	}
+	return http.ListenAndServe(":"+s.Config.HttpPort, h)
 }
 
 func (s *httpServer) awaitShutdown() {
@@ -202,9 +213,16 @@ func (s *httpServer) awaitShutdown() {
 	log.WithFields(log.Fields{"ns": "http", "at": "shutdown"}).Info()
 }
 
-func (s *httpServer) process(r io.Reader, remoteAddr string, requestID string, logplexDrainToken string) (error, int) {
+func (s *httpServer) process(ctx context.Context, r io.Reader, remoteAddr string, requestID string, logplexDrainToken string) (error, int) {
 	s.Add(1)
 	defer s.Done()
+
+	ctx, _ = tag.New(ctx,
+		tag.Insert(tagKeyRemoteAddr, remoteAddr),
+		tag.Insert(tagKeyRequestID, requestID),
+	)
+	ctx, span := trace.StartSpan(ctx, "process")
+	defer span.End()
 
 	fixedBody, err := s.FixerFunc(r, remoteAddr, logplexDrainToken)
 	if err != nil {
